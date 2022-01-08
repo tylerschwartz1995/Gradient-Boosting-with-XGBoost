@@ -205,3 +205,52 @@ xgmodel_nopromo <- train(learner = lrn_tune,task = traintask)
 predict_nopromo = predict(xgmodel_nopromo,newdata=test_mod,type="response")
 predict_nopromo = predict_nopromo[["data"]][["prob.1"]]
 
+#Step 5: Uplift Analysis and Final Customer Seletion
+
+#A. Import Predictions
+predict_nopromo = read.csv("predict_nopromo.csv")
+predict_promo = read.csv("predict_promo.csv")
+
+#B. Combining predictions of no-promo model and promo model
+predict = cbind(predict_nopromo,predict_promo)
+predict = as.data.frame(predict)
+
+#C. Calculating uplift
+predict$uplift = predict$predict_nopromo-predict$predict_promo
+
+#D. Merging predictions dataset with variables unique family, monthly rate of plan and family size
+predict_test = cbind.data.frame(test$unique_family,test$family_size,predict,test$base_monthly_rate_plan)
+predict_test$unique_family = predict_test$`test$unique_family` 
+predict_test$`test$unique_family` = NULL
+
+#E. Creating calculated columns for revenue. cost and profit, as well as weighted uplift (uplift*profit)
+predict_test$Rev = 24*(predict_test$`test$base_monthly_rate_plan`+predict_test$`test$base_monthly_rate_phone`)
+predict_test$Cost = predict_test$`test$family_size`*10
+predict_test$Profit = predict_test$Rev-predict_test$Cost
+predict_test$Up_Pro = predict_test$uplift*predict_test$Profit
+
+#F. Aggregating mean of each unique family id for both uplift and profit
+predict_up = aggregate(predict_test$uplift ~ predict_test$unique_family, predict_test, mean)
+predict_profit = aggregate(predict_test$Profit ~ predict_test$unique_family, predict_test, mean)
+
+#G. Renaming columns
+predict_up$unique=predict_up$`predict_test$unique_family`
+predict_up$`predict_test$unique_family` = NULL
+predict_profit$unique=predict_profit$`predict_test$unique_family`
+predict_profit$`predict_test$unique_family` = NULL
+
+#H. Merging two aggregated datasets created above and re-creating weighted uplift (uplift*profit)
+predict_master = merge(x=predict_up,y=predict_profit, by = "unique", all.x = TRUE)
+predict_master$up_pro = predict_master$`predict_test$Profit`*predict_master$`predict_test$uplift`
+
+#I. Choosing only those with values >65 of weighted uplift to send invites to
+classification_test= rep(0,nrow(predict_master))
+classification_test[predict_master$up_pro > 65]= 1 #
+sum(classification_test == 1)
+
+#J. Exporting selection
+test_out  = cbind.data.frame(predict_master$unique,classification_test)
+test_out = test_out %>%
+  filter(classification_test==1) %>%
+  select(c("predict_master$unique"))
+write.csv(test_out,"churn_selection.csv")
