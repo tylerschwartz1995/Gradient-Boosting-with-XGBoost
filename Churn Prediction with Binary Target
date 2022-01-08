@@ -1,0 +1,207 @@
+
+#Step 0: Loading packages
+library(dplyr)
+library(magrittr)
+library(caret)
+library(ROSE)
+library(psych)
+library(pROC)
+library(xgboost)
+library(data.table)
+library(dummies)
+library(mlr)
+library(plyr)
+
+#Step 1: Import Data
+train_raw = read.csv("train.csv")
+test_raw = read.csv("test.csv")
+
+#Step 2: Explore Data
+train_raw %>% nrow()
+train_raw %>% str()
+train_raw %>% head()
+train_raw %>% summary()
+
+#Step 3: Data Pre-processing
+
+#Making target variable into binary variable
+train_raw$churn_in_12 <- ifelse(train_raw$churn_in_12 == "True", 1, 0)
+
+#Converting variables into factors
+#Train
+train = train_raw %>% 
+  mutate(active = as.factor(active))  %>% 
+  mutate(gender = as.factor(gender))  %>% 
+  mutate(workphone = as.factor(workphone))  %>%
+  mutate(plan_type = as.factor(plan_type))  %>%
+  mutate(unlimited_voice = as.factor(unlimited_voice))  %>%
+  mutate(unlimited_text = as.factor(unlimited_text))  %>%
+  mutate(promo = as.factor(promo)) %>%
+  mutate(unique_id = as.factor(unique_id)) %>%
+  mutate(promo = as.factor(promo)) %>%
+  mutate(unique_id = as.factor(family_id)) %>%
+  mutate(unique_id = as.numeric(unique_id))  
+
+#Test
+test = test_raw %>% 
+  mutate(active = as.factor(active))  %>% 
+  mutate(gender = as.factor(gender))  %>% 
+  mutate(workphone = as.factor(workphone))  %>%
+  mutate(plan_type = as.factor(plan_type))  %>%
+  mutate(unlimited_voice = as.factor(unlimited_voice))  %>%
+  mutate(unlimited_text = as.factor(unlimited_text))  %>%
+  mutate(promo = as.factor(promo)) %>%
+  mutate(unique_id = as.factor(unique_id)) %>%
+  mutate(unique_id = as.numeric(unique_id)) 
+
+#Separate promo from non-promo
+train_nopromo = train[train$promo == 'False',]
+train_promo = train_raw[train_raw$promo == 'True',]
+test = test[test$promo == 'False',]
+
+#Creating family size variable
+fam_size_test = count(test$family_id)
+fam_size_test$family_id = fam_size_test$x
+fam_size_test$x = NULL
+fam_size_test$family_size = fam_size_test$freq
+fam_size_test$freq =NULL
+test <- merge(x=test, y=fam_size_test, by = "family_id", all.x = TRUE)
+
+#Use unique_id as id variable
+id = unique(train$unique_id)
+length(id) #1000000 which is good, no duplicate IDs
+
+#Looking at distribution of target (1 and 0)
+Good = sum(sum(train$churn_in_12 == 0))
+Bad = sum(sum(train$churn_in_12 == 1))
+
+#Keeping only necessary variables
+train_nopromo = train_nopromo %>% 
+  select(-c("active","unlimited_text","family_id","unique_id","promo"))
+train_promo = train_promo %>% 
+  select(-c("active","unlimited_text","family_id","unique_id","promo"))
+test = test %>% 
+  select(-c("active","unlimited_text","family_id","unique_id","unique_individual","promo")) 
+
+#Step 4: Gradient Boosting Model
+
+#A. One hot encoding factor variables
+
+#Train
+#Promo
+gender <- dummy.code(train_nopromo$gender)
+workphone <- dummy.code(train_nopromo$workphone)
+plan_type <- dummy.code(train_nopromo$plan_type)
+unlimited_voice <- dummy.code(train_nopromo$unlimited_voice)
+train_nopromo <- data.frame(train_nopromo,gender,workphone,plan_type,unlimited_voice)
+train_nopromo = train_nopromo %>% 
+  select(-c("gender","workphone","plan_type","unlimited_voice","Woman","False","buy","False.1","id"))
+
+#No_Promo
+gender <- dummy.code(train_promo$gender)
+workphone <- dummy.code(train_promo$workphone)
+plan_type <- dummy.code(train_promo$plan_type)
+unlimited_voice <- dummy.code(train_promo$unlimited_voice)
+train_promo <- data.frame(train_promo,gender,workphone,plan_type,unlimited_voice)
+train_promo = train_promo %>% 
+  select(-c("gender","workphone","plan_type","unlimited_voice","Woman","False","buy","False.1","id"))
+
+#Test
+gender <- dummy.code(test$gender)
+workphone <- dummy.code(test$workphone)
+plan_type <- dummy.code(test$plan_type)
+unlimited_voice <- dummy.code(test$unlimited_voice)
+test <- data.frame(test,gender,workphone,plan_type,unlimited_voice)
+test_mod = test %>% 
+  select(-c("gender","workphone","plan_type","unlimited_voice","Woman","False","buy","False.1","id","unique_family","family_size")) 
+
+#B. Converting to datatables
+setDT(train_nopromo)
+setDT(train_promo)
+setDT(test_mod) 
+
+#C. Creating XGBOOST Model Using Promo Data
+
+#Tuning parameters algorithm 
+train_promo$churn_in_12 = as.factor(train_promo$churn_in_12)
+train_promo = as.data.frame(train_promo)
+fact_col <- colnames(train_promo)[sapply(train_promo,is.character)]
+for(i in fact_col) set(train_promo,j=i,value = factor(train_promo[[i]]))
+traintask <- makeClassifTask(data = train_promo,target = "churn_in_12")
+test_mod = as.data.frame(test_mod)
+traintask = createDummyFeatures(obj = traintask) 
+
+#Tuning
+lrn <- makeLearner("classif.xgboost",predict.type = "prob")
+lrn$par.vals <- list( objective="binary:logistic",eval_metric = "aucpr")
+params <- makeParamSet( makeDiscreteParam("booster",values = c("gblinear","gbtree")),
+                        makeDiscreteParam("grow_policy",values = c("depthwise","lossguide")),
+                        makeIntegerParam("nrounds", lower = 100, upper = 1000), 
+                        makeIntegerParam("gamma", lower = 1, upper = 100),
+                        makeIntegerParam("max_depth",lower = 1L,upper = 14L), 
+                        makeNumericParam("min_child_weight",lower = 1L,upper = 20L),
+                        makeNumericParam("eta", lower = .2, upper = .8), 
+                        makeNumericParam("max_delta_step", lower = 0, upper = 10),
+                        makeNumericParam("lambda", lower = -1, upper = 0, trafo = function(x) 10^x),
+                        makeNumericParam("subsample",lower = 0.3,upper = 1), 
+                        makeNumericParam("colsample_bytree",lower = 0.3,upper = 1),
+                        makeNumericParam("scale_pos_weight",lower = 1,upper = 10))
+
+rdesc <- makeResampleDesc("CV",stratify = T,iters=8L)
+ctrl <- makeTuneControlRandom(maxit = 10L)
+library(parallel)
+library(parallelMap) 
+parallelStartSocket(cpus = detectCores())
+mytune_promo <- tuneParams(learner = lrn, task = traintask, resampling = rdesc, measures = acc, par.set = params, control = ctrl, show.info = T)
+mytune_promo$y 
+
+#Training model
+lrn_tune <- setHyperPars(lrn,par.vals = mytune_promo$x)
+xgmodel_promo <- train(learner = lrn_tune,task = traintask)
+
+#Making preditions on test set
+predict_promo = predict(xgmodel_promo,newdata=test_mod,type="response")
+predict_promo = predict_promo[["data"]][["prob.1"]]
+
+#D. Creating XGBOOST model using non-promo data
+
+#Tuning parameters algorithm 
+train_nopromo$churn_in_12 = as.factor(train_nopromo$churn_in_12)
+train_nopromo = as.data.frame(train_nopromo)
+fact_col <- colnames(train_nopromo)[sapply(train_nopromo,is.character)]
+for(i in fact_col) set(train_nopromo,j=i,value = factor(train_nopromo[[i]]))
+traintask <- makeClassifTask(data = train_nopromo,target = "churn_in_12")
+test_mod = as.data.frame(test_mod)
+traintask = createDummyFeatures(obj = traintask) 
+
+#Tuning hyperparameters
+lrn <- makeLearner("classif.xgboost",predict.type = "prob")
+lrn$par.vals <- list( objective="binary:logistic",eval_metric = "aucpr")
+params <- makeParamSet( makeDiscreteParam("booster",values = c("gblinear","gbtree")),
+                        makeDiscreteParam("grow_policy",values = c("depthwise","lossguide")),
+                        makeIntegerParam("nrounds", lower = 100, upper = 1000), 
+                        makeIntegerParam("gamma", lower = 1, upper = 40),
+                        makeIntegerParam("max_depth",lower = 1L,upper = 13L), 
+                        makeNumericParam("min_child_weight",lower = 1L,upper = 20L),
+                        makeNumericParam("eta", lower = .2, upper = .8), 
+                        makeNumericParam("max_delta_step", lower = 0, upper = 10),
+                        makeNumericParam("lambda", lower = -1, upper = 0, trafo = function(x) 10^x),
+                        makeNumericParam("subsample",lower = 0.3,upper = 1), 
+                        makeNumericParam("colsample_bytree",lower = 0.3,upper = 1),
+                        makeNumericParam("scale_pos_weight",lower = 1,upper = 5))
+rdesc <- makeResampleDesc("CV",stratify = T,iters=8L)
+ctrl <- makeTuneControlRandom(maxit = 10L)
+library(parallel)
+library(parallelMap) 
+parallelStartSocket(cpus = detectCores())
+mytune_nopromo <- tuneParams(learner = lrn, task = traintask, resampling = rdesc, measures = acc, par.set = params, control = ctrl, show.info = T)
+mytune_nopromo2$y 
+
+#Training model
+lrn_tune <- setHyperPars(lrn,par.vals = mytune_nopromo$x)
+xgmodel_nopromo <- train(learner = lrn_tune,task = traintask)
+
+#Making predictions on test set
+predict_nopromo = predict(xgmodel_nopromo,newdata=test_mod,type="response")
+predict_nopromo = predict_nopromo[["data"]][["prob.1"]]
+
